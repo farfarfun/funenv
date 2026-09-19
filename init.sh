@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 root="/farfarfun"
 download_if_not_exists() {
 	local FILE_NAME="$1"
@@ -23,16 +24,16 @@ install_miniconda() {
 	url="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
 	local filename="$root/Miniconda3-latest-Linux-x86_64.sh"
 	download_if_not_exists "$filename" "$url"
-	sh $filename -b -f -p $root/miniconda
-	rm $filename
+	sh "$filename" -b -f -p "$root/miniconda"
+	rm "$filename"
 }
 init_env() {
 	if [ -d "$root" ]; then
 		echo "$root 已存在，跳过"
 	else
-		mkdir $root
+		mkdir "$root"
 	fi
-	cd $root
+	cd "$root"
 	install_miniconda
 }
 

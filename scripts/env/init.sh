@@ -1,3 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+
 # ssh-keygen -t rsa -C "niuliangtao@qq.com"
 vim /etc/ssh/sshd_config
 
