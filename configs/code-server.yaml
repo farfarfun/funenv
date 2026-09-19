@@ -1,4 +1,4 @@
 bind-addr: 0.0.0.0:8443
 auth: password
-password: farafrfun
+password: ${CODE_SERVER_PASSWORD}
 user-data-dir: /farfarfun/fundev
