@@ -1,4 +1,11 @@
-bind-addr: 0.0.0.0:8443
+# code-server 配置模板。scripts/setup.sh 会以它为基础渲染出
+# .run/code-server-<env>.yaml（权限 0600）后再交给 code-server。
+#
+# 这里不要写 password / hashed-password：密码只能通过
+# CODE_SERVER_PASSWORD 环境变量注入，渲染时追加。
+#
+# 默认只监听回环地址。需要对外暴露时设置 CODE_SERVER_BIND_ADDR，
+# 例如 CODE_SERVER_BIND_ADDR=0.0.0.0:8443。
+bind-addr: 127.0.0.1:8443
 auth: password
-password: ${CODE_SERVER_PASSWORD}
 user-data-dir: /farfarfun/fundev

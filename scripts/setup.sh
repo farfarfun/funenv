@@ -1,20 +1,36 @@
 #!/usr/bin/env bash
 # code-server 服务统一入口：start / run / stop / restart / status
-# 用法：CODE_SERVER_PASSWORD=<password> ./scripts/setup.sh <action> <dev|prod>
+# 用法：CODE_SERVER_PASSWORD=<password> ./scripts/setup.sh <action> [dev|prod]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# ---- 配置块：端口、路径统一在此定义，全脚本复用 ----
-CODE_SERVER_PORT="${CODE_SERVER_PORT:-8443}"
+# ---- 配置块：端口、监听地址、路径统一在此定义，全脚本复用 ----
+# 默认值必须是安全的（SPEC §9.3）：默认只监听回环地址，需要对外暴露时
+# 由操作者显式设置 CODE_SERVER_BIND_ADDR / CODE_SERVER_HOST。
+CODE_SERVER_DEFAULT_HOST="127.0.0.1"
+CODE_SERVER_DEFAULT_PORT="8443"
 CODE_SERVER_BIN="${CODE_SERVER_BIN:-code-server}"
 RUN_DIR="$ROOT_DIR/.run"
-CONFIG_TEMPLATE="$ROOT_DIR/configs/code-server.yaml"
+SUPPORTED_ENVS=(dev prod)
 
 usage() {
-	echo "用法: $0 <start|run|stop|restart|status> [dev|prod]" >&2
-	echo "  start/run/stop/restart 必须指定 dev 或 prod 环境" >&2
+	cat >&2 <<'EOF'
+用法:
+  ./scripts/setup.sh start   <dev|prod>   后台启动
+  ./scripts/setup.sh run     <dev|prod>   前台启动（便于调试）
+  ./scripts/setup.sh stop    <dev|prod>   停止
+  ./scripts/setup.sh restart <dev|prod>   重启
+  ./scripts/setup.sh status  [dev|prod]   查看状态，省略环境时报告全部环境
+
+环境变量:
+  CODE_SERVER_PASSWORD   必填，登录密码；只允许通过环境变量传入
+  CODE_SERVER_BIND_ADDR  可选，形如 0.0.0.0:8443，显式覆盖监听地址
+  CODE_SERVER_HOST       可选，只覆盖监听地址的主机部分
+  CODE_SERVER_PORT       可选，只覆盖监听地址的端口部分
+  CODE_SERVER_BIN        可选，code-server 可执行文件，默认 code-server
+EOF
 	exit 1
 }
 
@@ -22,116 +38,298 @@ log() {
 	echo "[setup.sh] $*"
 }
 
-# 按环境隔离运行时文件，避免 dev/prod 相互覆盖
-pid_file() { echo "$RUN_DIR/code-server-$1.pid"; }
-log_file() { echo "$RUN_DIR/code-server-$1.log"; }
-rendered_config() { echo "$RUN_DIR/code-server-$1.yaml"; }
+die() {
+	echo "[setup.sh] 错误：$*" >&2
+	exit 1
+}
 
-is_running() {
-	local env="$1" pid_f pid
-	pid_f="$(pid_file "$env")"
+# 按环境隔离运行时文件，避免 dev/prod 相互覆盖
+pid_file() { printf '%s/code-server-%s.pid' "$RUN_DIR" "$1"; }
+log_file() { printf '%s/code-server-%s.log' "$RUN_DIR" "$1"; }
+rendered_config() { printf '%s/code-server-%s.yaml' "$RUN_DIR" "$1"; }
+# 记录启动时刻，用来证明 PID 还是当初那个进程
+token_file() { printf '%s/code-server-%s.start' "$RUN_DIR" "$1"; }
+
+# env 专属模板优先，没有就回落到通用模板
+config_template() {
+	local specific="$ROOT_DIR/configs/code-server.$1.yaml"
+	if [ -f "$specific" ]; then
+		printf '%s' "$specific"
+	else
+		printf '%s' "$ROOT_DIR/configs/code-server.yaml"
+	fi
+}
+
+# 进程是否真的活着。僵尸进程也能通过 `kill -0`，必须按进程状态排除，
+# 否则刚起就崩掉的服务会被一直报成「运行中」。
+pid_alive() {
+	local stat_out
+	stat_out="$(ps -ww -o stat= -p "$1" 2>/dev/null)" || return 1
+	[ -n "$stat_out" ] || return 1
+	case "$stat_out" in
+	*Z*) return 1 ;;
+	esac
+	return 0
+}
+
+read_pid() {
+	local pid_f="$1"
 	[ -f "$pid_f" ] || return 1
-	pid="$(cat "$pid_f" 2>/dev/null || true)"
+	tr -cd '0-9' <"$pid_f"
+}
+
+# 进程的启动时刻。PID 会被系统回收复用，但「PID + 启动时刻」事实上唯一，
+# 所以它才是「这个 PID 还是当初那个进程」的证明。
+# Linux 下读 /proc/<pid>/stat 第 22 个字段（jiffies 精度）；
+# 用 `.*) ` 贪婪截断可以躲开 comm 字段里可能出现的空格和括号。
+proc_start_token() {
+	local pid="$1" token=""
+	if [ -r "/proc/$pid/stat" ]; then
+		token="$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{ print $20 }')"
+	else
+		token="$(ps -ww -o lstart= -p "$pid" 2>/dev/null | tr -s ' ')"
+	fi
+	[ -n "$token" ] || return 1
+	printf '%s' "$token"
+}
+
+# 只认本脚本托管的那个进程。单纯 `kill -0` 会在 PID 被回收后让
+# status 误报运行中、让 stop 误杀别人的进程（SPEC §6.1 / §6.3）。
+is_running() {
+	local env="$1" pid recorded current token_f
+	pid="$(read_pid "$(pid_file "$env")")" || return 1
 	[ -n "$pid" ] || return 1
-	kill -0 "$pid" 2>/dev/null
+	pid_alive "$pid" || return 1
+	token_f="$(token_file "$env")"
+	[ -f "$token_f" ] || return 1
+	recorded="$(cat "$token_f" 2>/dev/null)"
+	[ -n "$recorded" ] || return 1
+	current="$(proc_start_token "$pid")" || return 1
+	[ "$recorded" = "$current" ] || return 1
+	return 0
+}
+
+# 清理本环境的 PID 与启动时刻记录
+clear_runtime_marks() {
+	rm -f "$(pid_file "$1")" "$(token_file "$1")"
 }
 
 require_bin() {
-	command -v "$CODE_SERVER_BIN" >/dev/null 2>&1 || {
-		echo "未找到可执行文件 $CODE_SERVER_BIN，请先安装 code-server。" >&2
-		exit 1
-	}
+	command -v "$CODE_SERVER_BIN" >/dev/null 2>&1 ||
+		die "未找到可执行文件 $CODE_SERVER_BIN，请先安装 code-server。"
 }
 
+# 把值渲染成 YAML 单引号标量，内部单引号按 YAML 规则双写。
+# 密码可能含 # & \ : 等字符，直接拼进 sed 表达式会被当成元字符。
+yaml_single_quote() {
+	local value="$1"
+	printf "'%s'" "${value//\'/\'\'}"
+}
+
+# 渲染运行时配置。密码只在这里落盘，且：
+#   1. 文件权限收紧到 0600，不再是默认 umask 下世界可读的 0644；
+#   2. 全程只用 Bash 内建命令写入，密码不会出现在任何进程的
+#      /proc/<pid>/cmdline 里（`ps aux` 读不到）。
 render_config() {
-	local env="$1" out
+	local env="$1" out tpl
 	out="$(rendered_config "$env")"
-	if [ -z "${CODE_SERVER_PASSWORD:-}" ]; then
-		echo "请先设置 CODE_SERVER_PASSWORD 环境变量（不要把密码写进 configs/code-server.yaml）。" >&2
-		exit 1
-	fi
+	tpl="$(config_template "$env")"
+	[ -f "$tpl" ] || die "找不到配置模板 $tpl"
+	[ -n "${CODE_SERVER_PASSWORD:-}" ] ||
+		die "请通过 CODE_SERVER_PASSWORD 环境变量提供密码，不要写进 configs/code-server.yaml。"
 	mkdir -p "$RUN_DIR"
-	sed "s#\${CODE_SERVER_PASSWORD}#${CODE_SERVER_PASSWORD}#g" "$CONFIG_TEMPLATE" >"$out"
-	echo "$out"
+	rm -f "$out"
+	(
+		umask 077
+		: >"$out"
+	)
+	# 过滤模板里可能残留的 password/hashed-password，避免与注入值产生重复键
+	grep -v -E '^[[:space:]]*(password|hashed-password)[[:space:]]*:' "$tpl" >>"$out" || true
+	printf 'password: %s\n' "$(yaml_single_quote "$CODE_SERVER_PASSWORD")" >>"$out"
+}
+
+# 只有操作者显式给出环境变量时才下发 --bind-addr。code-server 的命令行参数
+# 优先级高于配置文件，无条件下发会让脚本里的代码默认值吞掉用户在
+# configs/code-server.yaml 里写的 bind-addr（SPEC §9.3 优先级倒挂）。
+bind_addr_override() {
+	if [ -n "${CODE_SERVER_BIND_ADDR:-}" ]; then
+		printf '%s' "$CODE_SERVER_BIND_ADDR"
+	elif [ -n "${CODE_SERVER_HOST:-}" ] || [ -n "${CODE_SERVER_PORT:-}" ]; then
+		printf '%s:%s' \
+			"${CODE_SERVER_HOST:-$CODE_SERVER_DEFAULT_HOST}" \
+			"${CODE_SERVER_PORT:-$CODE_SERVER_DEFAULT_PORT}"
+	fi
+}
+
+# 仅用于展示：没有环境变量覆盖时读配置文件里的 bind-addr
+effective_bind_addr() {
+	local env="$1" override from_cfg tpl
+	override="$(bind_addr_override)"
+	if [ -n "$override" ]; then
+		printf '%s' "$override"
+		return
+	fi
+	tpl="$(config_template "$env")"
+	from_cfg=""
+	if [ -f "$tpl" ]; then
+		from_cfg="$(sed -n 's/^[[:space:]]*bind-addr[[:space:]]*:[[:space:]]*//p' "$tpl" | head -1)"
+	fi
+	printf '%s' "${from_cfg:-$CODE_SERVER_DEFAULT_HOST:$CODE_SERVER_DEFAULT_PORT}"
+}
+
+# 用 Bash 数组传命令，不拼字符串、不用 eval（SPEC §6.3）
+build_cmd() {
+	local env="$1" override
+	CODE_SERVER_CMD=("$CODE_SERVER_BIN" --config "$(rendered_config "$env")")
+	override="$(bind_addr_override)"
+	[ -z "$override" ] || CODE_SERVER_CMD+=(--bind-addr "$override")
+}
+
+refuse_if_running() {
+	local env="$1" pid
+	if is_running "$env"; then
+		pid="$(read_pid "$(pid_file "$env")")"
+		die "code-server($env) 已在运行 (PID $pid)，拒绝重复启动。"
+	fi
+}
+
+# 启动后必须确认进程真的活着。只写 PID 就报成功的话，端口被占用、
+# 配置写错、user-data-dir 不可写这些失败都会被包装成「启动成功」，
+# 并在 .run/ 里留下一个死 PID。
+verify_started() {
+	local env="$1" i
+	# 观察一段时间，确认它不是「起来就立刻崩」
+	for ((i = 0; i < 15; i++)); do
+		sleep 0.1
+		is_running "$env" || return 1
+	done
+	return 0
 }
 
 do_start() {
-	local env="$1" pid_f log_f cfg
+	local env="$1" log_f pid token
 	require_bin
-	if is_running "$env"; then
-		echo "code-server($env) 已在运行 (PID $(cat "$(pid_file "$env")"))，拒绝重复启动。" >&2
+	refuse_if_running "$env"
+	log_f="$(log_file "$env")"
+	clear_runtime_marks "$env" # 清理陈旧的 PID / 启动时刻记录
+	render_config "$env"
+	build_cmd "$env"
+	nohup "${CODE_SERVER_CMD[@]}" >>"$log_f" 2>&1 &
+	pid=$!
+	if ! token="$(proc_start_token "$pid")"; then
+		echo "[setup.sh] 错误：code-server($env) 启动后立即退出，日志尾部：" >&2
+		tail -n 20 "$log_f" >&2 2>/dev/null || true
 		exit 1
 	fi
-	pid_f="$(pid_file "$env")"
-	log_f="$(log_file "$env")"
-	rm -f "$pid_f" # 清理可能存在的陈旧 PID 文件
-	cfg="$(render_config "$env")"
-	nohup "$CODE_SERVER_BIN" --config "$cfg" --bind-addr "0.0.0.0:$CODE_SERVER_PORT" >>"$log_f" 2>&1 &
-	echo $! >"$pid_f"
-	log "code-server($env) 已后台启动，PID $(cat "$pid_f")，端口 $CODE_SERVER_PORT，日志：$log_f"
+	echo "$pid" >"$(pid_file "$env")"
+	printf '%s' "$token" >"$(token_file "$env")"
+	if ! verify_started "$env" "$pid"; then
+		clear_runtime_marks "$env"
+		echo "[setup.sh] 错误：code-server($env) 启动失败，日志尾部：" >&2
+		tail -n 20 "$log_f" >&2 2>/dev/null || true
+		exit 1
+	fi
+	log "code-server($env) 已后台启动，PID $pid，监听 $(effective_bind_addr "$env")，日志：$log_f"
 }
 
 do_run() {
-	local env="$1" cfg
+	local env="$1"
 	require_bin
-	if is_running "$env"; then
-		echo "code-server($env) 已在后台运行 (PID $(cat "$(pid_file "$env")"))，请先 stop。" >&2
-		exit 1
-	fi
-	cfg="$(render_config "$env")"
-	exec "$CODE_SERVER_BIN" --config "$cfg" --bind-addr "0.0.0.0:$CODE_SERVER_PORT"
+	refuse_if_running "$env"
+	render_config "$env"
+	build_cmd "$env"
+	log "code-server($env) 前台启动，监听 $(effective_bind_addr "$env")"
+	exec "${CODE_SERVER_CMD[@]}"
 }
 
 do_stop() {
-	local env="$1" pid_f pid
+	local env="$1" pid_f pid i
 	pid_f="$(pid_file "$env")"
 	if ! is_running "$env"; then
-		log "code-server($env) 未运行（或 PID 文件已过期），清理陈旧 PID 文件。"
-		rm -f "$pid_f"
+		if [ -f "$pid_f" ]; then
+			log "code-server($env) 未运行，清理陈旧 PID 文件 $pid_f"
+			clear_runtime_marks "$env"
+		else
+			log "code-server($env) 未运行"
+		fi
 		return 0
 	fi
-	pid="$(cat "$pid_f")"
-	kill "$pid"
-	rm -f "$pid_f"
+	pid="$(read_pid "$pid_f")"
+	kill "$pid" 2>/dev/null || true
+	# 必须等它真的退出，否则紧随其后的 start 会撞上还没释放的端口
+	for ((i = 0; i < 100; i++)); do
+		pid_alive "$pid" || break
+		sleep 0.1
+	done
+	if pid_alive "$pid"; then
+		log "code-server($env) 未响应 SIGTERM，发送 SIGKILL"
+		kill -9 "$pid" 2>/dev/null || true
+		for ((i = 0; i < 20; i++)); do
+			pid_alive "$pid" || break
+			sleep 0.1
+		done
+	fi
+	wait "$pid" 2>/dev/null || true # 若是本次调用启动的子进程，顺手回收
+	! pid_alive "$pid" || die "无法停止 code-server($env) (PID $pid)"
+	clear_runtime_marks "$env"
 	log "code-server($env) 已停止 (PID $pid)"
 }
 
-do_status() {
-	local env="$1"
+do_status_one() {
+	local env="$1" pid_f pid
+	pid_f="$(pid_file "$env")"
 	if is_running "$env"; then
-		log "code-server($env) 运行中，PID $(cat "$(pid_file "$env")")，端口 $CODE_SERVER_PORT"
+		pid="$(read_pid "$pid_f")"
+		log "code-server($env) 运行中，PID $pid，监听 $(effective_bind_addr "$env")"
+	elif [ -f "$pid_f" ]; then
+		log "code-server($env) 未运行（$pid_f 是陈旧 PID 文件）"
 	else
 		log "code-server($env) 未运行"
 	fi
 }
 
+# status 必须非交互；省略环境时报告所有已配置环境（SPEC §6.1）
+do_status() {
+	local target="$1" env
+	if [ -n "$target" ]; then
+		do_status_one "$target"
+		return 0
+	fi
+	for env in "${SUPPORTED_ENVS[@]}"; do
+		do_status_one "$env"
+	done
+}
+
+valid_env() {
+	local candidate="$1" known
+	for known in "${SUPPORTED_ENVS[@]}"; do
+		[ "$candidate" != "$known" ] || return 0
+	done
+	return 1
+}
+
 ACTION="${1:-}"
-ENV="${2:-}"
+TARGET_ENV="${2:-}"
+[ "$#" -le 2 ] || usage
 [ -n "$ACTION" ] || usage
 
 case "$ACTION" in
 start | run | stop | restart)
-	case "$ENV" in
-	dev | prod) ;;
-	*) usage ;;
-	esac
+	valid_env "$TARGET_ENV" || usage
 	;;
 status)
-	case "$ENV" in
-	dev | prod) ;;
-	*) usage ;;
-	esac
+	[ -z "$TARGET_ENV" ] || valid_env "$TARGET_ENV" || usage
 	;;
 *) usage ;;
 esac
 
 case "$ACTION" in
-start) do_start "$ENV" ;;
-run) do_run "$ENV" ;;
-stop) do_stop "$ENV" ;;
+start) do_start "$TARGET_ENV" ;;
+run) do_run "$TARGET_ENV" ;;
+stop) do_stop "$TARGET_ENV" ;;
 restart)
-	do_stop "$ENV" || true
-	do_start "$ENV"
+	do_stop "$TARGET_ENV"
+	do_start "$TARGET_ENV"
 	;;
-status) do_status "$ENV" ;;
+status) do_status "$TARGET_ENV" ;;
 esac
