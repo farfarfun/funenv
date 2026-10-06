@@ -118,6 +118,17 @@ assert_eq "status 省略环境时退出码为 0" 0 "$rc"
 assert_contains "status 省略环境时报告 dev" "$out" "code-server(dev)"
 assert_contains "status 省略环境时报告 prod" "$out" "code-server(prod)"
 
+# prod 不得复用 dev 的 PATH/环境变量桩；正式安装入口不存在时必须直接失败。
+new_sandbox
+out="$(CODE_SERVER_PASSWORD='pw' CODE_SERVER_BIN="$STUB_DIR/code-server" setup_sh start prod 2>&1)"
+assert_eq "prod 缺少正式包时退出码为 1" 1 "$?"
+assert_contains "prod 缺少正式包时拒绝开发二进制回退" "$out" "/usr/bin/code-server"
+if [ -f "$WORK/repo/.run/code-server-prod.yaml" ]; then
+	ng "prod 缺少正式包时不渲染运行时配置" "配置文件仍存在"
+else
+	ok "prod 缺少正式包时不渲染运行时配置"
+fi
+
 echo "== 2. 凭据处理 =="
 new_sandbox
 out="$(CODE_SERVER_PASSWORD='' setup_sh start dev 2>&1)"
