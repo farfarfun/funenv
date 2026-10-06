@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # code-server 服务统一入口：start / run / stop / restart / status
-# 用法：CODE_SERVER_PASSWORD=<password> ./scripts/setup.sh <action> [dev|prod]
+# 用法：CODE_SERVER_PASSWORD='change-me' ./scripts/setup.sh <action> [dev|prod]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,7 +11,10 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # 由操作者显式设置 CODE_SERVER_BIND_ADDR / CODE_SERVER_HOST。
 CODE_SERVER_DEFAULT_HOST="127.0.0.1"
 CODE_SERVER_DEFAULT_PORT="8443"
-CODE_SERVER_BIN="${CODE_SERVER_BIN:-code-server}"
+# CODE_SERVER_BIN 仅供 dev 使用，方便开发时注入测试桩或自定义安装位置。
+CODE_SERVER_DEV_BIN="${CODE_SERVER_BIN:-code-server}"
+# prod 只能使用系统正式安装包提供的固定入口，不能回退到 PATH 或本地构建产物。
+readonly CODE_SERVER_PROD_BIN="/usr/bin/code-server"
 RUN_DIR="$ROOT_DIR/.run"
 SUPPORTED_ENVS=(dev prod)
 
@@ -29,7 +32,7 @@ usage() {
   CODE_SERVER_BIND_ADDR  可选，形如 0.0.0.0:8443，显式覆盖监听地址
   CODE_SERVER_HOST       可选，只覆盖监听地址的主机部分
   CODE_SERVER_PORT       可选，只覆盖监听地址的端口部分
-  CODE_SERVER_BIN        可选，code-server 可执行文件，默认 code-server
+  CODE_SERVER_BIN        可选，仅 dev 使用的 code-server 可执行文件，默认 code-server
 EOF
 	exit 1
 }
@@ -114,9 +117,23 @@ clear_runtime_marks() {
 	rm -f "$(pid_file "$1")" "$(token_file "$1")"
 }
 
+code_server_bin() {
+	case "$1" in
+	dev) printf '%s' "$CODE_SERVER_DEV_BIN" ;;
+	prod) printf '%s' "$CODE_SERVER_PROD_BIN" ;;
+	esac
+}
+
 require_bin() {
-	command -v "$CODE_SERVER_BIN" >/dev/null 2>&1 ||
-		die "未找到可执行文件 $CODE_SERVER_BIN，请先安装 code-server。"
+	local env="$1" bin
+	bin="$(code_server_bin "$env")"
+	if [ "$env" = "prod" ]; then
+		[ -x "$bin" ] ||
+			die "未找到正式安装包提供的 $bin；prod 不会使用 CODE_SERVER_BIN、本地构建产物或 PATH 回退。"
+	else
+		command -v "$bin" >/dev/null 2>&1 ||
+			die "未找到可执行文件 $bin，请先安装 code-server。"
+	fi
 }
 
 # 把值渲染成 YAML 单引号标量，内部单引号按 YAML 规则双写。
@@ -179,8 +196,9 @@ effective_bind_addr() {
 
 # 用 Bash 数组传命令，不拼字符串、不用 eval（SPEC §6.3）
 build_cmd() {
-	local env="$1" override
-	CODE_SERVER_CMD=("$CODE_SERVER_BIN" --config "$(rendered_config "$env")")
+	local env="$1" override bin
+	bin="$(code_server_bin "$env")"
+	CODE_SERVER_CMD=("$bin" --config "$(rendered_config "$env")")
 	override="$(bind_addr_override)"
 	[ -z "$override" ] || CODE_SERVER_CMD+=(--bind-addr "$override")
 }
@@ -208,7 +226,7 @@ verify_started() {
 
 do_start() {
 	local env="$1" log_f pid token
-	require_bin
+	require_bin "$env"
 	refuse_if_running "$env"
 	log_f="$(log_file "$env")"
 	clear_runtime_marks "$env" # 清理陈旧的 PID / 启动时刻记录
@@ -234,7 +252,7 @@ do_start() {
 
 do_run() {
 	local env="$1"
-	require_bin
+	require_bin "$env"
 	refuse_if_running "$env"
 	render_config "$env"
 	build_cmd "$env"
