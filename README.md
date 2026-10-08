@@ -21,17 +21,15 @@ cd funenv
 ./init.sh
 
 # 启动 code-server（请改为安全的实际密码）
-CODE_SERVER_PASSWORD='change-me' ./scripts/setup.sh start dev
+CODE_SERVER_PASSWORD='change-me' ./scripts/setup.sh start
 ```
 
 ## scripts/setup.sh 用法
 
-统一管理 code-server 生命周期。`start`/`run`/`stop`/`restart` 必须指定 `dev` 或 `prod`；
-`status` 的环境参数可省略，省略时报告全部环境：
+统一管理当前安装的 code-server 实例，运行命令不接受 `dev`/`prod` 参数：
 
 ```bash
-CODE_SERVER_PASSWORD='change-me' ./scripts/setup.sh start dev
-CODE_SERVER_PASSWORD='change-me' ./scripts/setup.sh start prod
+CODE_SERVER_PASSWORD='change-me' ./scripts/setup.sh start
 ./scripts/setup.sh status
 ```
 
@@ -46,7 +44,7 @@ CODE_SERVER_PASSWORD='change-me' ./scripts/setup.sh start prod
 ### 凭据
 
 密码只能通过 `CODE_SERVER_PASSWORD` 环境变量传入，`configs/code-server.yaml` 里不含任何
-`password` / `hashed-password` 字段。启动时脚本把密码渲染进 `.run/code-server-<env>.yaml`：
+`password` / `hashed-password` 字段。启动时脚本把密码渲染进 `.run/code-server.yaml`：
 
 - 该文件权限为 `0600`，不会被同机其他用户读到；
 - 密码全程只经 Bash 内建命令写入，不会作为命令行参数出现在 `/proc/<pid>/cmdline`（即 `ps aux` 读不到）；
@@ -63,20 +61,17 @@ CODE_SERVER_PASSWORD='change-me' ./scripts/setup.sh start prod
 | `CODE_SERVER_BIND_ADDR` | 整体覆盖，如 `0.0.0.0:8443` |
 | `CODE_SERVER_HOST` | 只覆盖主机部分 |
 | `CODE_SERVER_PORT` | 只覆盖端口部分 |
-| `CODE_SERVER_BIN` | 仅 `dev` 使用的 code-server 可执行文件，默认 `code-server` |
+| `CODE_SERVER_BIN` | code-server 可执行文件，默认 `code-server` |
+| `CODE_SERVER_CONFIG` | 配置模板路径，默认 `configs/code-server.yaml` |
 
 要把服务暴露到公网需显式设置 `CODE_SERVER_BIND_ADDR=0.0.0.0:<port>`，并自行确保前置
 反向代理与 TLS 到位。
 
-### 运行时文件与多环境
+### 运行时文件
 
 日志、PID、启动时刻记录、渲染后的配置统一位于 `.run/`（已在 `.gitignore` 中），
-不同 `env` 相互隔离，拒绝重复启动。若存在 `configs/code-server.<env>.yaml`，
-该环境会优先使用它，否则回落到 `configs/code-server.yaml`。
-
-`prod` 只能运行系统正式安装包提供的 `/usr/bin/code-server`，不会使用
-`CODE_SERVER_BIN`、`PATH` 中的同名文件或仓库内构建产物。请先通过系统的受支持包管理方式
-安装正式包；该入口不存在或不可执行时，生产启动会失败。
+同一时间只托管一个实例并拒绝重复启动。需要使用其他配置时显式设置
+`CODE_SERVER_CONFIG`，不再通过运行参数复制多套状态。
 
 ## 测试
 

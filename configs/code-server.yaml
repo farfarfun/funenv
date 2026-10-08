@@ -1,5 +1,5 @@
 # code-server 配置模板。scripts/setup.sh 会以它为基础渲染出
-# .run/code-server-<env>.yaml（权限 0600）后再交给 code-server。
+# .run/code-server.yaml（权限 0600）后再交给 code-server。
 #
 # 这里不要写 password / hashed-password：密码只能通过
 # CODE_SERVER_PASSWORD 环境变量注入，渲染时追加。
