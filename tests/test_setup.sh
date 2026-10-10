@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scripts/setup.sh 的行为测试。用一个桩 code-server 替代真实二进制，
-# 覆盖参数解析、凭据处理、监听地址优先级、PID 生命周期四类行为。
+# 覆盖参数解析、凭据处理、监听地址优先级、PID 生命周期、前台 run 路径五类行为。
 #
 # 运行：./tests/test_setup.sh
 set -uo pipefail
@@ -84,6 +84,17 @@ make_failing_stub() {
 #!/usr/bin/env bash
 echo "fatal: address already in use" >&2
 exit 1
+EOF
+	chmod +x "$STUB_DIR/code-server"
+}
+
+# 把桩换成「记录参数后以指定退出码退出」的版本，用于验证前台退出码透传
+make_exiting_stub() {
+	cat >"$STUB_DIR/code-server" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >"$WORK/argv.txt"
+echo "stub exiting with $1" >&2
+exit $1
 EOF
 	chmod +x "$STUB_DIR/code-server"
 }
@@ -278,6 +289,76 @@ if ps -p "$old_pid" >/dev/null 2>&1; then
 else
 	ok "restart 已终止旧进程"
 fi
+setup_sh stop >/dev/null 2>&1
+
+echo "== 7. run 前台路径（SPEC §6.1 start 后台 / run 前台） =="
+new_sandbox
+out="$(CODE_SERVER_PASSWORD='' setup_sh run 2>&1)"
+assert_eq "run 缺少 CODE_SERVER_PASSWORD 时退出码为 1" 1 "$?"
+assert_contains "run 缺少密码时给出明确提示" "$out" "CODE_SERVER_PASSWORD"
+
+new_sandbox
+out="$(CODE_SERVER_BIN='code-server-not-installed' CODE_SERVER_PASSWORD='pw' setup_sh run 2>&1)"
+assert_eq "可执行文件缺失时 run 退出码为 1" 1 "$?"
+assert_contains "可执行文件缺失时 run 提示先安装" "$out" "未找到可执行文件"
+
+new_sandbox
+# 长寿命桩 + 后台调用：run 必须一直占着前台，不能自己返回
+CODE_SERVER_PASSWORD='fg-s3cr3t' setup_sh run >"$WORK/run.log" 2>&1 &
+run_pid=$!
+for _ in $(seq 1 50); do
+	[ -s "$WORK/argv.txt" ] && break
+	sleep 0.1
+done
+if [ -s "$WORK/argv.txt" ]; then
+	ok "run 在前台拉起 code-server"
+else
+	ng "run 在前台拉起 code-server" "桩程序未被执行；输出：$(cat "$WORK/run.log" 2>/dev/null)"
+fi
+assert_contains "run 下发渲染后的配置" "$(cat "$WORK/argv.txt" 2>/dev/null)" "--config"
+# 前台路径同样不能把密码塞进命令行参数（/proc/<pid>/cmdline 世界可读）
+assert_not_contains "run 时密码未出现在 code-server 的命令行参数里" \
+	"$(cat "$WORK/argv.txt" 2>/dev/null)" "fg-s3cr3t"
+rendered="$WORK/repo/.run/code-server.yaml"
+if [ -f "$rendered" ]; then
+	assert_eq "run 渲染的配置权限为 600" 600 "$(stat -c '%a' "$rendered")"
+else
+	ng "run 渲染的配置权限为 600" "$rendered 不存在"
+fi
+# run 不托管进程，不该留下 PID 文件（SPEC §6.3 只为自己托管的后台进程写 PID）
+if [ -f "$WORK/repo/.run/code-server.pid" ]; then
+	ng "run 不写 PID 文件" "PID 文件仍存在"
+else
+	ok "run 不写 PID 文件"
+fi
+stat_out="$(ps -ww -o stat= -p "$run_pid" 2>/dev/null || true)"
+case "${stat_out:-EXITED}" in
+*Z* | EXITED) ng "run 持续占据前台，不自行返回" "进程 $run_pid 已退出（stat=[$stat_out]）" ;;
+*) ok "run 持续占据前台，不自行返回" ;;
+esac
+kill "$run_pid" 2>/dev/null || true
+pkill -f "$STUB_DIR/sleeper" 2>/dev/null || true
+wait "$run_pid" 2>/dev/null || true
+
+new_sandbox
+make_exiting_stub 42
+out="$(CODE_SERVER_PASSWORD='pw' setup_sh run 2>&1)"
+assert_eq "run 原样透传 code-server 的非 0 退出码" 42 "$?"
+assert_contains "run 不吞掉 code-server 的输出" "$out" "stub exiting with 42"
+
+new_sandbox
+make_exiting_stub 0
+CODE_SERVER_PASSWORD='pw' CODE_SERVER_PORT=18443 setup_sh run >/dev/null 2>&1
+rc=$?
+assert_eq "code-server 正常退出时 run 退出码为 0" 0 "$rc"
+assert_contains "run 同样应用 CODE_SERVER_PORT 覆盖" \
+	"$(cat "$WORK/argv.txt" 2>/dev/null)" "--bind-addr 127.0.0.1:18443"
+
+new_sandbox
+CODE_SERVER_PASSWORD='pw' setup_sh start >/dev/null 2>&1
+out="$(CODE_SERVER_PASSWORD='pw' setup_sh run 2>&1)"
+assert_eq "已有后台实例时 run 退出码为 1" 1 "$?"
+assert_contains "已有后台实例时 run 拒绝启动" "$out" "拒绝重复启动"
 setup_sh stop >/dev/null 2>&1
 
 echo

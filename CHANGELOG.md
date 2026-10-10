@@ -8,6 +8,7 @@
 - README 补充项目简介、安装步骤、最小运行示例与 `scripts/setup.sh` 用法说明；末尾追加组织统一介绍区块。
 - 新增 `tests/test_setup.sh`：覆盖参数解析、凭据处理、监听地址优先级、PID 生命周期四类行为，共 45 条断言。已反向验证——回退到本次修复前的实现时其中 21 条会失败。
 - `scripts/setup.sh` 支持 `CODE_SERVER_BIND_ADDR` / `CODE_SERVER_HOST` 覆盖监听地址，以及 `configs/code-server.<env>.yaml` 形式的环境专属配置。
+- `tests/test_setup.sh` 补齐前台 `run` 路径用例（缺密码、可执行文件缺失、前台常驻不自行返回、不写 PID 文件、渲染配置权限 0600、密码不进命令行参数、监听地址覆盖、退出码原样透传、已有后台实例时拒绝启动），断言总数增至 57 条。已反向验证——把 `do_run` 的 `exec` 改成后台执行并去掉重复启动检查后，其中 6 条会失败。
 
 ### 修复
 
