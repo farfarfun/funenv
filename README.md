@@ -9,7 +9,7 @@ farfarfun 内部开发/测试环境的一键初始化与 code-server 服务管�
 - `scripts/env/init.sh`：配置 SSH 免密登录相关的 sshd 参数。
 - `scripts/setup.sh`：code-server 服务的统一启停入口。
 - `configs/code-server.yaml`：code-server 配置模板，密码通过环境变量注入，不写进文件。
-- `tests/test_setup.sh`：`scripts/setup.sh` 的行为测试（参数解析、凭据处理、监听地址优先级、PID 生命周期）。
+- `tests/test_setup.sh`：`scripts/setup.sh` 的行为测试（参数解析、凭据处理、监听地址优先级、PID 生命周期、前台 `run` 路径）。
 
 ## 快速开始
 
